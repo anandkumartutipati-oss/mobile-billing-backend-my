@@ -1,0 +1,5 @@
+node_modules
+.env
+seed.js
+test-login.js
+sample_products.csv
