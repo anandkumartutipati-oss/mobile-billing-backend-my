@@ -51,7 +51,7 @@ const getAllowedOrigins = () => {
         }
         
         // Always allow common Vercel frontend patterns
-        origins.push('https://mobile-billing-frontend.vercel.app');
+        origins.push('https://mobile-billing-frontend-my.vercel.app');
         // Note: Vercel preview URLs are handled by pattern matching below
         
         // If no origins specified, log warning but allow all (for initial setup)
