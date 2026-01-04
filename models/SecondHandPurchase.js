@@ -9,7 +9,12 @@ const secondHandPurchaseSchema = new mongoose.Schema({
     brand: String,
     category: {
         type: String,
-        default: 'Mobile'
+        default: 'Mobile Phones'
+    },
+    simType: {
+        type: String,
+        enum: ['Single SIM', 'Dual SIM', 'None'],
+        default: 'None'
     },
     imei: {
         type: [String],

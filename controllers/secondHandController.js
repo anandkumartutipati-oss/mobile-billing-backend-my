@@ -10,6 +10,7 @@ export const createSecondHandPurchase = async (req, res) => {
             name,
             brand,
             category,
+            simType,
             imei,
             specifications,
             description,
@@ -46,7 +47,7 @@ export const createSecondHandPurchase = async (req, res) => {
             .map(i => String(i).replace(/\D/g, ''))
             .filter(i => i.length === 15);
 
-        if (cleanedImeis.length === 0 && (category === 'Mobile' || category === 'Tablet')) {
+        if (cleanedImeis.length === 0 && (category === 'Mobile' || category === 'Mobile Phones' || category === 'Tablet' || category === 'Tablets')) {
             return res.status(400).json({ message: "Invalid IMEI numbers. Mobile/Tablet requires 15-digit IMEIs." });
         }
 
@@ -56,7 +57,8 @@ export const createSecondHandPurchase = async (req, res) => {
         const buyback = new SecondHandPurchase({
             name: name.trim(),
             brand: brand ? brand.trim() : '',
-            category: category || 'Mobile',
+            category: category === 'Mobile' ? 'Mobile Phones' : (category || 'Mobile Phones'),
+            simType: simType || 'None',
             imei: cleanedImeis,
             specifications: specifications ? specifications.trim() : '',
             description: description ? description.trim() : '',

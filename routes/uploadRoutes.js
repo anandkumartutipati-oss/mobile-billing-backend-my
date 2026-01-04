@@ -8,11 +8,8 @@ const router = express.Router();
 const storage = multer.memoryStorage();
 
 function checkFileType(file, cb) {
-    const filetypes = /jpg|jpeg|png|webp/;
-    const extname = filetypes.test(file.originalname.toLowerCase());
-    const mimetype = filetypes.test(file.mimetype);
-
-    if (extname && mimetype) {
+    // Allow any image file type
+    if (file.mimetype.startsWith('image/')) {
         return cb(null, true);
     } else {
         cb(new Error('Images only!'));
@@ -30,8 +27,10 @@ const upload = multer({
 });
 
 router.post('/', protect, upload.single('image'), (req, res) => {
+    console.log("Upload route hit");
     try {
         if (!req.file) {
+            console.log("No file in request");
             return res.status(400).json({ message: 'No file uploaded' });
         }
 

@@ -68,92 +68,118 @@ export const createInvoice = async (req, res) => {
 
             if (product) {
                 // --- EXISTING PRODUCT LOGIC ---
-                unitPrice = item.price !== undefined ? Number(item.price) : product.sellingPrice;
-                let itemDiscount = 0;
+                // --- EXISTING PRODUCT LOGIC ---
+                // "sellingPrice" in DB is usually the MRP/Inclusive price
+                let inputPrice = item.price !== undefined ? Number(item.price) : product.sellingPrice;
+                let discountAmount = Number(item.discount || 0);
 
-                if (item.price === undefined) {
-                    const offerData = await getDiscountedPrice(product, product.sellingPrice, item.quantity);
-                    unitPrice = offerData.price;
-                    itemDiscount = offerData.discount;
+                // Enforce GST Rules based on Category
+                let itemGstPercent = 18; // Default
+                const categoryLower = (product.category || '').toLowerCase();
+
+                if (categoryLower.includes('mobile') || categoryLower.includes('phone') || categoryLower.includes('smartphone')) {
+                    itemGstPercent = 12; // Mandated 12% for mobile phones
+                } else {
+                    itemGstPercent = product.gstPercent || 18;
                 }
 
-                itemGstPercent = item.gstPercent !== undefined ? Number(item.gstPercent) : (product.gstPercent || 18);
-                // Validate GST percent (0-100)
-                itemGstPercent = Math.max(0, Math.min(100, itemGstPercent || 0));
+                // Override attempt check: If user sends a different GST, we ignore it for Mobiles to remain compliant
+                // For accessories, we trust the DB or fallback to 18
 
-                // Validate quantity
+                // Validations
                 const itemQuantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
-                if (itemQuantity !== Number(item.quantity)) {
-                    return res.status(400).json({ message: `Invalid quantity for ${product.name}` });
-                }
-
-                // Strict Stock Validation
                 if (product.stockQuantity < itemQuantity) {
-                    return res.status(400).json({
-                        message: `Insufficient stock for ${product.name}. Available: ${product.stockQuantity}, Requested: ${itemQuantity}`
-                    });
+                    return res.status(400).json({ message: `Insufficient stock for ${product.name}` });
                 }
 
-                // IMEI Validation - Only for Mobiles & Tablets
-                const cat = String(product.category || '').toLowerCase();
-                const isMobileOrTablet = cat.includes('mobile') || cat.includes('tablet');
+                // IMEI Validation
+                const isMobileOrTablet = product.trackIMEI;
+                if (isMobileOrTablet) {
+                    const providedIMEIs = (item.imei || []).map(i => String(i).trim()).filter(Boolean);
+                    const slotsPerUnit = (product.simType === 'Dual SIM') ? 2 : 1;
+                    const expectedCount = itemQuantity * slotsPerUnit;
 
-                if (product.trackIMEI && isMobileOrTablet) {
-                    if (!item.imei || item.imei.length === 0) {
-                        return res.status(400).json({ message: `IMEI numbers are required for ${product.name} (Category: ${product.category})` });
+                    if (providedIMEIs.length !== expectedCount) {
+                        return res.status(400).json({
+                            message: `IMEI Mismatch: Expected ${expectedCount} IMEIs for ${product.name} (Qty: ${itemQuantity}, Type: ${product.simType}), got ${providedIMEIs.length}`
+                        });
                     }
-                    const requestImeis = (item.imei || []).map(i => String(i || '').trim()).filter(Boolean);
-                    const stockImeis = (product.imei || []).map(i => String(i || '').trim()).filter(Boolean);
 
-                    const missingIMEIs = requestImeis.filter(i => !stockImeis.includes(i));
-                    if (missingIMEIs.length > 0) {
-                        console.log(`Note: Manual/New IMEIs entered for ${product.name}:`, missingIMEIs);
-                        // We allow manual entries as per user request, so we don't return 400 here.
-                    }
-                    item.imei = requestImeis; // Record all entered IMEIs in the invoice
+                    // Validate against stock? (Optional but recommended)
+                    // const validStockIMEIs = (product.imei || []).map(i => String(i).trim());
+                    // const invalidIMEIs = providedIMEIs.filter(i => !validStockIMEIs.includes(i));
+                    // if (invalidIMEIs.length > 0) ...
+
+                    item.imei = providedIMEIs;
+                } else {
+                    item.imei = []; // Clear IMEIs if not required
                 }
 
-                itemLineTotal = unitPrice * itemQuantity; // This is now treated as INCLUSIVE
+                // --- COMPLIANT CALCULATION ---
+                // 1. Transaction Value (Inclusive) = (Unit Price * Qty) - Discount
+                // Note: The "price" sent from frontend is usually per unit. discount is often per unit or total?
+                // Standard convention: inputPrice is per unit. discount sent here is likely per-item total or we treat manual discount carefully.
+                // Let's assume item.discount is TOTAL discount for this line item (common in POS).
+
+                const totalInclusivePrice = (inputPrice * itemQuantity) - discountAmount;
+                const finalTransactionValue = Math.max(0, totalInclusivePrice);
+
+                // 2. Taxable Value (Reverse Calculation)
+                // Taxable = TransactionValue / (1 + GST%)
+                const gstMultiplier = 1 + (itemGstPercent / 100);
+                const taxableValue = finalTransactionValue / gstMultiplier;
+
+                // 3. GST Amount
+                const gstAmount = finalTransactionValue - taxableValue;
+
+                // 4. Split
+                const cgst = gstAmount / 2;
+                const sgst = gstAmount / 2;
+
+                itemLineTotal = finalTransactionValue; // This is what the customer pays (Total)
 
                 processedItemsRaw.push({
                     product: product._id,
                     name: product.name,
                     category: product.category,
                     quantity: itemQuantity,
-                    price: unitPrice, // Inclusive Price
+                    price: inputPrice, // Unit Price (Inclusive, before discount)
                     originalPrice: product.sellingPrice,
                     purchasePrice: product.purchasePrice,
-                    imei: product.trackIMEI ? item.imei : [],
+                    imei: item.imei,
                     simType: product.simType,
                     gstPercent: itemGstPercent,
-                    discount: item.discount || 0,
+                    discount: discountAmount,
+                    taxableValue: taxableValue, // NEW FIELD
+                    cgst: cgst, // NEW FIELD
+                    sgst: sgst, // NEW FIELD
+                    gstAmount: gstAmount, // NEW FIELD
                     itemLineTotal
                 });
 
                 // Update Stock
                 const updatePayload = { $inc: { stockQuantity: -itemQuantity } };
                 if (product.trackIMEI) {
-                    console.log(`[STOCK DEBUG] Pulling IMEIs for ${product.name}:`, item.imei);
                     updatePayload.$pull = { imei: { $in: item.imei } };
                 }
-
-                console.log(`[STOCK DEBUG] Updating product ${item.product} with payload:`, JSON.stringify(updatePayload));
-                const updatedProduct = await Product.findByIdAndUpdate(item.product, updatePayload, { new: true });
-                console.log(`[STOCK DEBUG] New Stock for ${updatedProduct.name}: ${updatedProduct.stockQuantity}`);
+                await Product.findByIdAndUpdate(item.product, updatePayload);
 
             } else {
-                // --- AD-HOC ITEM LOGIC (Second Hand / Manual) ---
-                if (!item.name || item.price === undefined) {
-                    return res.status(400).json({ message: 'Item requires either a valid product or a name and price' });
-                }
-
+                // --- AD-HOC ITEM LOGIC ---
+                // Apply strict 18% unless specified, but usually ad-hoc is for accessories/services
                 unitPrice = Math.max(0, Number(item.price) || 0);
-                // Respect item's GST percent (often 0 for second hand)
+                let discountAmount = Number(item.discount || 0);
                 itemGstPercent = item.gstPercent !== undefined ? Number(item.gstPercent) : 18;
-                itemGstPercent = Math.max(0, Math.min(100, itemGstPercent || 0));
-                const itemQuantity = Math.max(1, Math.floor(Number(item.quantity) || 1));
+                const itemQuantity = Math.max(1, Number(item.quantity) || 1);
 
-                itemLineTotal = unitPrice * itemQuantity; // Treated as INCLUSIVE
+                const totalInclusivePrice = (unitPrice * itemQuantity) - discountAmount;
+                const finalTransactionValue = Math.max(0, totalInclusivePrice);
+
+                const gstMultiplier = 1 + (itemGstPercent / 100);
+                const taxableValue = finalTransactionValue / gstMultiplier;
+                const gstAmount = finalTransactionValue - taxableValue;
+
+                itemLineTotal = finalTransactionValue;
 
                 processedItemsRaw.push({
                     product: null,
@@ -162,62 +188,80 @@ export const createInvoice = async (req, res) => {
                     quantity: itemQuantity,
                     price: unitPrice,
                     originalPrice: unitPrice,
-                    purchasePrice: Math.max(0, Number(item.purchasePrice) || 0),
-                    imei: item.imei || [],
-                    simType: item.simType || 'None',
+                    purchasePrice: 0,
+                    imei: [],
+                    simType: 'None',
                     gstPercent: itemGstPercent,
+                    discount: discountAmount,
+                    taxableValue: taxableValue,
+                    gstAmount: gstAmount,
+                    cgst: gstAmount / 2,
+                    sgst: gstAmount / 2,
                     itemLineTotal
                 });
-                // No stock update for ad-hoc items
             }
             grossTotal += itemLineTotal;
         }
 
-        // --- GLOBAL DISCOUNT & FINAL TOTALS ---
-        let finalDiscount = Math.max(0, Number(discount) || 0);
+        // --- GLOBAL DISCOUNT HANDLING ---
+        // If a global discount is applied on top of item discounts, we need to redistribute it?
+        // Usually, POS allows either Item Discount OR Global Discount. 
+        // If both, Global Discount reduces the Total Payable, which effectively reduces Taxable Value further.
+
+        let globalDiscount = Math.max(0, Number(discount) || 0);
         if (discountType === 'Percentage') {
-            finalDiscount = (grossTotal * finalDiscount) / 100;
+            globalDiscount = (grossTotal * globalDiscount) / 100;
         }
-        finalDiscount = Math.min(finalDiscount, grossTotal);
 
-        // The Grand Total is simply Gross Total (Inclusive) minus Discount
-        const grandTotal = Math.round(grossTotal - finalDiscount);
+        // If global discount exists, we must recalculate everything proportionally
+        // Because GST is levied on the FINAL Transaction Value.
 
-        // Redistribute net amount back to items to get accurate GST/Subtotal (matched frontend)
-        let subTotal = 0;
-        let gstTotal = 0;
+        const grandTotal = Math.max(0, grossTotal - globalDiscount);
 
         const processedItems = processedItemsRaw.map(item => {
-            // itemShare is the portion of the final Grand Total allocated to this item
-            const itemRatio = grossTotal > 0 ? (item.itemLineTotal / grossTotal) : 0;
-            const itemShare = (grossTotal - finalDiscount) * itemRatio;
+            if (globalDiscount > 0 && grossTotal > 0) {
+                // Redistribute global discount
+                const weight = item.itemLineTotal / grossTotal;
+                const itemShareGlobalDiscount = globalDiscount * weight;
 
-            const gstPercent = Math.max(0, Number(item.gstPercent) || 0);
-            const gstDivisor = 1 + (gstPercent / 100);
+                // New effective total for this item
+                const newTotal = item.itemLineTotal - itemShareGlobalDiscount;
 
-            // Taxable = Inclusive / (1 + GST%)
-            const itemTaxable = itemShare / gstDivisor;
-            const itemGst = itemShare - itemTaxable;
+                // Recalculate Tax
+                const gstMultiplier = 1 + (item.gstPercent / 100);
+                const newTaxable = newTotal / gstMultiplier;
+                const newGst = newTotal - newTaxable;
 
-            // Proportional discount for this item
-            const itemDiscount = (finalDiscount * itemRatio);
-
-            subTotal += itemTaxable;
-            gstTotal += itemGst;
-
+                return {
+                    ...item,
+                    discount: item.discount + itemShareGlobalDiscount, // Total effective discount
+                    total: Math.round(newTotal), // Item Final Total
+                    taxableValue: newTaxable,
+                    gstAmount: newGst,
+                    cgst: newGst / 2,
+                    sgst: newGst / 2
+                };
+            }
             return {
                 ...item,
-                gstPercent: gstPercent,
-                gstAmount: Math.round(itemGst),
-                discount: Math.round(itemDiscount),
-                total: Math.round(itemShare)
+                total: Math.round(item.itemLineTotal)
             };
         });
 
-        // Round final totals to whole numbers for consistent UI/Report display
+        // Remap totals
+        let subTotal = 0; // This should be Taxable Total usually, or Pre-Tax? 
+        // In this system, subTotal usually meant "Total before global discount".
+        // Let's align with invoice standards: SubTotal = Sum of Taxable Values? Or Sum of Item Totals?
+        // To avoid frontend breakage, let's keep logic but ensure we pass detailed fields for the invoice.
+        // Let's set subTotal = Sum of Taxable Values (True SubTotal)
+
+        subTotal = processedItems.reduce((acc, curr) => acc + curr.taxableValue, 0);
+        const gstTotal = processedItems.reduce((acc, curr) => acc + curr.gstAmount, 0);
+
         const roundedSubTotal = Math.round(subTotal);
         const roundedGstTotal = Math.round(gstTotal);
-        const roundedDiscount = Math.round(finalDiscount);
+        const roundedDiscount = Math.round(globalDiscount);
+        // grandTotal is already calculated
 
         // --- PAYMENT LOGIC ---
         const activePaymentMode = paymentMode || paymentMethod || 'Cash';
@@ -386,7 +430,7 @@ export const getDashboardStats = async (req, res) => {
         const invoices = await Invoice.find({
             createdAt: { $gte: firstDayOfMonth },
             status: { $ne: 'Cancelled' }
-        });
+        }).populate('customer');
 
         let todaySales = 0;
         let todayCount = 0;
@@ -394,7 +438,6 @@ export const getDashboardStats = async (req, res) => {
         let monthSales = 0;
         let monthProfit = 0;
 
-        // Payment Mode Breakdown (For Monthly Sales)
         const paymentModes = {
             Cash: 0,
             UPI: 0,
@@ -402,11 +445,52 @@ export const getDashboardStats = async (req, res) => {
             EMI: 0
         };
 
+        const salesBreakdown = [];
+        const profitBreakdown = [];
+        const monthProfitBreakdown = [];
+        const discountBreakdown = [];
+        let monthDiscount = 0;
+
         (invoices || []).forEach(inv => {
             if (!inv) return;
 
-            const grandTotal = Math.max(0, Number(inv.grandTotal || 0));
-            monthSales += grandTotal;
+            const isToday = (inv.createdAt && new Date(inv.createdAt) >= today);
+
+            // LOGGING START
+            const items = inv.items || [];
+            const grossSum = items.reduce((s, i) => s + (Number(i.total) || (Number(i.price || 0) * (Number(i.quantity) || 0))), 0);
+            console.log(`[STATS DEBUG] Invoice ${inv.invoiceNumber}: GrandTotal=${inv.grandTotal}, CalculatedGross=${grossSum}, Discount=${inv.discount}`);
+            // LOGGING END
+
+            // Handle Customer Name (Populated or String)
+            const customerName = inv.customer?.name || inv.customerName || 'Walk-in Customer';
+
+            const currentGrandTotal = Math.max(0, Number(inv.grandTotal || 0));
+            monthSales += currentGrandTotal;
+
+            // Discount Calculation
+            const discountVal = Math.max(0, Number(inv.discount || 0));
+            monthDiscount += discountVal;
+
+            if (discountVal > 0) {
+                discountBreakdown.push({
+                    invoiceNumber: inv.invoiceNumber,
+                    customerName: customerName,
+                    amount: currentGrandTotal,
+                    discount: discountVal,
+                    date: inv.createdAt
+                });
+            }
+
+            // Population of sales breakdown for ALL invoices in the month
+            salesBreakdown.push({
+                invoiceNumber: inv.invoiceNumber,
+                customerName: customerName,
+                itemCount: (inv.items || []).length,
+                amount: currentGrandTotal,
+                date: inv.createdAt,
+                isToday: isToday // Added flag to filter today vs month in frontend if needed
+            });
 
             // Aggregate Payment Modes
             if (inv.paymentMode === 'Mixed') {
@@ -418,32 +502,80 @@ export const getDashboardStats = async (req, res) => {
                 // If there's an EMI portion in a mixed payment
                 if (inv.emiDetails) {
                     const downPayment = Number(inv.emiDetails.downPayment) || 0;
-                    const totalPayable = grandTotal; // For simplicity in pie chart, we use principal
-                    const emiPortion = grandTotal - downPayment;
+                    const totalPayable = currentGrandTotal; // For simplicity in pie chart, we use principal
+                    const emiPortion = currentGrandTotal - downPayment;
                     paymentModes.EMI += Math.max(0, emiPortion);
                 }
             } else if (inv.paymentMode === 'EMI') {
                 const downPayment = Number(inv.emiDetails?.downPayment) || 0;
                 paymentModes.Cash += downPayment; // Assuming downpayment is cash if not mixed
-                paymentModes.EMI += Math.max(0, grandTotal - downPayment);
+                paymentModes.EMI += Math.max(0, currentGrandTotal - downPayment);
             } else if (paymentModes[inv.paymentMode] !== undefined) {
-                paymentModes[inv.paymentMode] += grandTotal;
+                paymentModes[inv.paymentMode] += currentGrandTotal;
             }
 
+            // Calculate Invoice Gross Total (Pre-discount, inclusive of tax stored in price if any)
+            const invoiceGrossTotal = (inv.items || []).reduce((sum, item) => {
+                const qty = Math.max(0, Number(item.quantity || 0));
+                // Use total if available (it refers to price*qty in recent schema) or calc it
+                const itemTotal = Number(item.total) || (Number(item.price || 0) * qty);
+                return sum + itemTotal;
+            }, 0);
+
             let invCost = 0;
+
             (inv.items || []).forEach(item => {
                 if (item) {
-                    invCost += Math.max(0, Number(item.purchasePrice || 0)) * Math.max(0, Number(item.quantity || 0));
+                    const qty = Math.max(0, Number(item.quantity || 0));
+                    const pPrice = Math.max(0, Number(item.purchasePrice || 0));
+                    const cost = pPrice * qty;
+                    invCost += cost;
+
+                    // Unified Breakdown Logic: Calculate for ALL invoices to populate monthProfitBreakdown
+
+                    // Simple Apportionment Logic:
+                    // Item Net Revenue = (Item Gross / Invoice Gross) * Invoice Grand Total
+                    const itemGross = Number(item.total) || (Number(item.price || 0) * qty);
+
+                    let itemNetRevenue = itemGross;
+                    if (invoiceGrossTotal > 1) { // Use > 1 to avoid small precision issues
+                        // Force scaling to ensure sum of parts == grandTotal
+                        itemNetRevenue = Math.round((itemGross / invoiceGrossTotal) * currentGrandTotal);
+                    } else if (invoiceGrossTotal === 0 && currentGrandTotal > 0) {
+                        // Fallback: if somehow gross is 0 but we have a grandTotal, 
+                        // just use a proportional share of currentGrandTotal (though this shouldn't happen)
+                        itemNetRevenue = currentGrandTotal / (inv.items?.length || 1);
+                    }
+
+                    // Simple Profit = Revenue - Cost
+                    const itemProfit = itemNetRevenue - cost;
+
+                    console.log(`  [ITEM DEBUG] ${item.name}: Qty=${qty}, Gross=${itemGross}, NetRev=${itemNetRevenue.toFixed(2)}, Cost=${cost}, Profit=${itemProfit.toFixed(2)}`);
+
+                    const breakdownItem = {
+                        name: item.name,
+                        customerName: customerName, // Use resolved name
+                        qty: qty,
+                        revenue: itemNetRevenue,
+                        profit: itemProfit,
+                        date: inv.createdAt
+                    };
+
+                    monthProfitBreakdown.push(breakdownItem);
+
+                    if (isToday) {
+                        profitBreakdown.push(breakdownItem);
+                    }
                 }
             });
 
-            const subTotal = Math.max(0, Number(inv.subTotal || 0));
-            const discount = Math.max(0, Number(inv.discount || 0));
-            const invProfit = Math.max(0, (subTotal - invCost) - discount);
+            // Invoice Level Profit (Simple Cash Basis)
+            // Revenue (Grand Total) - Cost (Purchase Price total)
+            const invProfit = currentGrandTotal - invCost;
             monthProfit += invProfit;
 
-            if (inv.createdAt && new Date(inv.createdAt) >= today) {
-                todaySales += grandTotal;
+            if (isToday) {
+                todaySales += currentGrandTotal;
                 todayCount += 1;
                 todayProfit += invProfit;
             }
@@ -485,7 +617,12 @@ export const getDashboardStats = async (req, res) => {
             totalStockValue,
             lowStockAlerts,
             paymentModes,
-            categoryCounts
+            categoryCounts,
+            salesBreakdown,
+            profitBreakdown,
+            monthProfitBreakdown,
+            monthDiscount,
+            discountBreakdown
         });
     } catch (err) {
         console.error("Dashboard Stats Error:", err);

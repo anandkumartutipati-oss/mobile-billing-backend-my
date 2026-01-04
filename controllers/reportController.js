@@ -52,25 +52,30 @@ export const getSalesReport = async (req, res) => {
                 }
             });
 
-            const subTotal = Math.max(0, Number(inv.subTotal || 0));
-            const discount = Math.max(0, Number(inv.discount || 0));
-            const profit = Math.max(0, (subTotal - costPrice) - discount);
-
             const grandTotal = Math.max(0, Number(inv.grandTotal || 0));
             const gstTotal = Math.max(0, Number(inv.gstTotal || 0));
+
+            // Profit = Net Revenue (Tax Exclusive) - Cost
+            // Net Revenue (Tax Exclusive) = GrandTotal - GSTTotal
+            const netRevenue = grandTotal - gstTotal;
+            const profit = netRevenue - costPrice;
+
+            const discount = Math.max(0, Number(inv.discount || 0));
 
             totalSales += grandTotal;
             totalProfit += profit;
             totalDiscount += discount;
             totalGST += gstTotal;
 
+            const customerName = inv.customer?.name || inv.customerName || 'Walk-in';
+
             return {
                 _id: inv._id,
                 invoiceNumber: inv.invoiceNumber || 'N/A',
                 date: inv.createdAt || new Date(),
-                customer: inv.customerName || (inv.customer?.name || 'Walk-in'),
+                customer: customerName,
                 mobile: inv.customerMobile || (inv.customer?.mobile || 'N/A'),
-                itemsCount: (inv.items || []).length,
+                itemCount: (inv.items || []).length,
                 amount: grandTotal,
                 profit: profit,
                 paymentMode: inv.paymentMode || 'Cash'
@@ -115,7 +120,7 @@ export const getStockReport = async (req, res) => {
             const purchasePrice = Math.max(0, Number(p.purchasePrice || 0));
             const sellingPrice = Math.max(0, Number(p.sellingPrice || 0));
             const lowStockThreshold = Math.max(0, Number(p.lowStockThreshold || 0));
-            
+
             const stockValue = stockQuantity * purchasePrice;
             totalStockValue += stockValue;
             totalItems += stockQuantity;
@@ -254,17 +259,28 @@ export const getProfitBreakdown = async (req, res) => {
 
         (invoices || []).forEach(inv => {
             if (!inv || !inv.items) return;
+
+            const currentGrandTotal = Math.max(0, Number(inv.grandTotal || 0));
+            const invoiceGrossTotal = (inv.items || []).reduce((sum, item) => {
+                const qty = Math.max(0, Number(item.quantity || 0));
+                const itemTotal = Number(item.total) || (Number(item.price || 0) * qty);
+                return sum + itemTotal;
+            }, 0);
+
             (inv.items || []).forEach(item => {
                 if (!item || !item.name) return;
                 const key = item.name;
                 const quantity = Math.max(0, Number(item.quantity || 0));
                 const purchasePrice = Math.max(0, Number(item.purchasePrice || 0));
-                const price = Math.max(0, Number(item.price || 0));
-                
+
+                const itemGross = Number(item.total) || (Number(item.price || 0) * quantity);
+                let itemNetRevenue = itemGross;
+                if (invoiceGrossTotal > 1) {
+                    itemNetRevenue = (itemGross / invoiceGrossTotal) * currentGrandTotal;
+                }
+
                 const cost = purchasePrice * quantity;
-                const revenue = price * quantity;
-                // Basic item profit (doesn't account for invoice-level discount precisely here)
-                const profit = revenue - cost;
+                const profit = itemNetRevenue - cost;
 
                 if (!itemProfitMap[key]) {
                     itemProfitMap[key] = {
@@ -275,7 +291,7 @@ export const getProfitBreakdown = async (req, res) => {
                     };
                 }
                 itemProfitMap[key].quantity += quantity;
-                itemProfitMap[key].revenue += revenue;
+                itemProfitMap[key].revenue += itemNetRevenue;
                 itemProfitMap[key].profit += profit;
             });
         });
@@ -365,10 +381,10 @@ export const getWeeklySalesData = async (req, res) => {
 
         (invoices || []).forEach(inv => {
             if (!inv) return;
-            
+
             const invDate = inv.createdAt ? new Date(inv.createdAt) : new Date();
             if (isNaN(invDate.getTime())) return;
-            
+
             const dayStart = new Date(invDate);
             dayStart.setHours(0, 0, 0, 0);
 
