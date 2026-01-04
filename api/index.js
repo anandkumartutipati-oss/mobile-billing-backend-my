@@ -74,7 +74,8 @@ const setCORSHeaders = (res, origin) => {
             origins.push(`https://${process.env.VERCEL_URL}`);
         }
         // Always allow common frontend patterns
-        origins.push('https://mobile-billing-frontend.vercel.app');
+        origins.push('https://mobile-billing-frontend-my.vercel.app');
+        
         return origins;
     };
     
